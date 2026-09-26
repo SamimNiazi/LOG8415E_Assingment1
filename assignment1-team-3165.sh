@@ -15,6 +15,7 @@ bash setup_alb.sh
 echo "########## 4/5 Starting the custom load balancer (port 9000) ##########"
 python3 -m venv lb_venv
 source lb_venv/bin/activate
+pip install -q --upgrade pip setuptools wheel
 pip install -q fastapi "uvicorn[standard]" httpx aiohttp
 nohup python3 custom_lb.py > custom_lb.log 2>&1 &
 echo $! > custom_lb.pid

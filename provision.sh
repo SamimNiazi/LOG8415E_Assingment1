@@ -1,6 +1,7 @@
 #!/bin/bash
-# Step 1/4: provision 5x t3.micro (cluster1) + 4x m7g.large (cluster2, Graviton)
-# Falls back to m6i.large if m7g.large isn't offered in this region.
+# Step 1/4: provision 5x small (cluster1) + 4x large (cluster2)
+# Idempotent: skips creation if matching running/pending instances already exist.
+# Tries a chain of instance types in case your Learner Lab restricts newer families.
 set -e
 
 TEAM_SEED=3165
@@ -39,35 +40,91 @@ AMI_X86=$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/al
 AMI_ARM=$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
   --query 'Parameters[0].Value' --output text)
 
-echo "== Launching 5x t3.micro (cluster1 / small) =="
-SMALL_IDS=$(aws ec2 run-instances \
-  --image-id "$AMI_X86" --instance-type t3.micro --count 5 \
-  --key-name "$KEY_NAME" --security-group-ids "$SG_ID" --subnet-id "$SUBNET_ID" \
-  --associate-public-ip-address \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-small},{Key=Cluster,Value=cluster1}]" \
-  --query 'Instances[].InstanceId' --output text)
-echo "$SMALL_IDS" | tr '\t' '\n' > small_instance_ids.txt
+# --- reuse existing instances if this script already ran successfully ---
+existing_ids() {
+  local name_tag=$1
+  aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${name_tag}" "Name=instance-state-name,Values=pending,running" \
+    --query 'Reservations[].Instances[].InstanceId' --output text
+}
 
-echo "== Launching 4x m7g.large (cluster2 / large) =="
-if ! LARGE_IDS=$(aws ec2 run-instances \
-  --image-id "$AMI_ARM" --instance-type m7g.large --count 4 \
-  --key-name "$KEY_NAME" --security-group-ids "$SG_ID" --subnet-id "$SUBNET_ID" \
-  --associate-public-ip-address \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-large},{Key=Cluster,Value=cluster2}]" \
-  --query 'Instances[].InstanceId' --output text 2>/dev/null); then
-  echo "m7g.large unavailable in this region, falling back to m6i.large (x86)"
-  LARGE_IDS=$(aws ec2 run-instances \
-    --image-id "$AMI_X86" --instance-type m6i.large --count 4 \
+echo "== Cluster1 (small, t3.micro) =="
+EXISTING_SMALL=$(existing_ids "${STACK_NAME}-small")
+if [ -n "$EXISTING_SMALL" ]; then
+  echo "Found existing running/pending small instances, reusing: $EXISTING_SMALL"
+  echo "$EXISTING_SMALL" | tr '\t' '\n' > small_instance_ids.txt
+else
+  SMALL_IDS=$(aws ec2 run-instances \
+    --image-id "$AMI_X86" --instance-type t3.micro --count 5 \
     --key-name "$KEY_NAME" --security-group-ids "$SG_ID" --subnet-id "$SUBNET_ID" \
     --associate-public-ip-address \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-large},{Key=Cluster,Value=cluster2}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-small},{Key=Cluster,Value=cluster1}]" \
     --query 'Instances[].InstanceId' --output text)
+  echo "$SMALL_IDS" | tr '\t' '\n' > small_instance_ids.txt
 fi
-echo "$LARGE_IDS" | tr '\t' '\n' > large_instance_ids.txt
+
+echo "== Cluster2 (large) =="
+EXISTING_LARGE=$(existing_ids "${STACK_NAME}-large")
+if [ -n "$EXISTING_LARGE" ]; then
+  echo "Found existing running/pending large instances, reusing: $EXISTING_LARGE"
+  echo "$EXISTING_LARGE" | tr '\t' '\n' > large_instance_ids.txt
+else
+  # Try instance types in order until one actually launches AND survives past pending.
+  # Learner Labs commonly restrict newer/graviton families, so fall all the way
+  # back to a type we already know is allowed (t3.large) if needed.
+  LARGE_TYPES=(m7g.large c7g.large m6i.large c6i.large m5.large t3.large)
+  LARGE_AMI_FOR_TYPE() { case "$1" in m7g.large|c7g.large) echo "$AMI_ARM" ;; *) echo "$AMI_X86" ;; esac; }
+
+  LARGE_IDS=""
+  for t in "${LARGE_TYPES[@]}"; do
+    ami=$(LARGE_AMI_FOR_TYPE "$t")
+    echo "Trying instance type: $t"
+    if ids=$(aws ec2 run-instances \
+        --image-id "$ami" --instance-type "$t" --count 4 \
+        --key-name "$KEY_NAME" --security-group-ids "$SG_ID" --subnet-id "$SUBNET_ID" \
+        --associate-public-ip-address \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-large},{Key=Cluster,Value=cluster2}]" \
+        --query 'Instances[].InstanceId' --output text 2>launch_err.log); then
+      # launch call succeeded — but Learner Lab compliance can still kill it
+      # seconds later, so verify it's still alive before trusting it.
+      sleep 15
+      alive=$(aws ec2 describe-instances --instance-ids $ids \
+        --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text)
+      if echo "$alive" | grep -qv "terminated\|shutting-down"; then
+        echo "$t launched and is still alive:"
+        echo "$alive"
+        LARGE_IDS="$ids"
+        echo "$t" > large_instance_type.txt
+        break
+      else
+        echo "$t was auto-terminated shortly after launch (Learner Lab restriction). Trying next type."
+        echo "$alive"
+      fi
+    else
+      echo "$t rejected at launch:"
+      cat launch_err.log
+      echo "Trying next type."
+    fi
+  done
+
+  if [ -z "$LARGE_IDS" ]; then
+    echo "ERROR: none of the candidate large instance types survived in this Learner Lab."
+    echo "Check the region restriction panel in your lab page and adjust LARGE_TYPES in this script."
+    exit 1
+  fi
+  echo "$LARGE_IDS" | tr '\t' '\n' > large_instance_ids.txt
+fi
 
 echo "== Waiting for instances to reach running state =="
-aws ec2 wait instance-running --instance-ids $(cat small_instance_ids.txt) $(cat large_instance_ids.txt)
+ALL_IDS="$(cat small_instance_ids.txt) $(cat large_instance_ids.txt)"
+if ! aws ec2 wait instance-running --instance-ids $ALL_IDS; then
+  echo "Waiter failed. Current states:"
+  aws ec2 describe-instances --instance-ids $ALL_IDS \
+    --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,StateTransitionReason]' \
+    --output table
+  exit 1
+fi
 
 echo "Provisioning complete."
 echo "Small (cluster1): $(cat small_instance_ids.txt | tr '\n' ' ')"
-echo "Large (cluster2): $(cat large_instance_ids.txt | tr '\n' ' ')"
+echo "Large (cluster2), type $(cat large_instance_type.txt 2>/dev/null || echo '?'): $(cat large_instance_ids.txt | tr '\n' ' ')"
