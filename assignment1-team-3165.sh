@@ -12,7 +12,7 @@ bash deploy_app.sh
 echo "########## 3/5 Setting up the ALB, target groups, routing rules ##########"
 bash setup_alb.sh
 
-echo "########## 4/5 Starting the custom load balancer (port 9000) ##########"
+echo "########## 4/5 Starting the custom load balancer (port 8800) ##########"
 python3 -m venv lb_venv
 source lb_venv/bin/activate
 pip install -q --upgrade pip setuptools wheel
@@ -30,10 +30,10 @@ python3 benchmark.py "http://$ALB_DNS" /cluster1
 echo "--- AWS ALB /cluster2 ---"
 python3 benchmark.py "http://$ALB_DNS" /cluster2
 echo "--- Custom LB /cluster1 ---"
-python3 benchmark.py "http://localhost:9000" /cluster1
+python3 benchmark.py "http://localhost:8800" /cluster1
 echo "--- Custom LB /cluster2 ---"
-python3 benchmark.py "http://localhost:9000" /cluster2
+python3 benchmark.py "http://localhost:8800" /cluster2
 
 echo ""
 echo "All done. For the chaos check, watch: tail -f custom_lb.log"
-echo "and: watch -n1 curl -s http://localhost:9000/lb-status"
+echo "and: watch -n1 curl -s http://localhost:8800/lb-status"
