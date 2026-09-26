@@ -4,6 +4,7 @@ Usage: python benchmark.py <base_url> <route> [num_requests]
 Example: python benchmark.py http://my-alb-dns.amazonaws.com /cluster1
 """
 import asyncio
+import os
 import statistics
 import sys
 import time
@@ -48,3 +49,7 @@ if __name__ == "__main__":
     route = sys.argv[2] if len(sys.argv) > 2 else "/cluster1"
     n = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
     asyncio.run(main(base_url, route, n))
+    sys.stdout.flush()
+    # Some hosts segfault during aiohttp's C-extension teardown at normal
+    # interpreter exit, after results are already printed. Skip that teardown.
+    os._exit(0)
